@@ -1,0 +1,40 @@
+# Privacy policy for synthetic Indian hospital records.
+# Applied on local files only. No remote services and no language models.
+
+scope: synthetic_indian_hospital_records
+offline: true
+cpu_only: true
+llm: false
+
+direct_identifiers:
+  - patient_name
+  - aadhaar
+  - pan
+  - abha
+  - uhid
+  - mobile
+  - email
+  - address
+  - guardian_name
+  - doctor_name
+  - date_of_birth
+
+quasi_identifiers:
+  - age
+  - sex
+  - pincode
+  - district
+  - department
+  - admission_year
+
+pseudonym:
+  method: hmac-sha256
+  reversible: false
+
+privacy:
+  k_anonymity: 5
+  suppress_below_k: true
+
+sanitizer:
+  direct_identifiers: redact
+  unclassified_spans: redact
