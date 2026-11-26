@@ -5,22 +5,18 @@ Regex only. No language model and no network calls.
 Names after "Dr." are kept (they are not returned). Names after C/O, S/o,
 D/o, and W/o are returned so a later stage can remove them. Medicine names
 and doses, such as "Dolo 650", "Ramipril 5 mg", and "1-0-1", are never
-returned.
+returned. A protect-list cancels any tag on a disease or a medicine
+(Parkinson's, bukhar, Dolo, Ramipril, sugar, bp), so those words stay.
 
-Hindi names in Devanagari are romanized with indic-transliteration when that
-library is installed. Detection still works without it.
+Hindi names are romanized locally: रमेश कुमार becomes ramesh kumar.
 """
 
 from __future__ import annotations
 
 import re
 
-try:
-    from indic_transliteration import sanscript
-    from indic_transliteration.sanscript import transliterate as _transliterate
-except ImportError:  # optional local library
-    sanscript = None
-    _transliterate = None
+from utils.medical import is_medical_span, is_medical_token
+from utils.translit import to_latin
 
 # One Devanagari syllable is a letter plus its vowel signs. A word is several
 # syllables. Digits (०-९) are left out so doses are not treated as names.
@@ -58,7 +54,8 @@ _DOCTOR = _any(["Dr", "Doctor"])
 _RELATIVE = r"(?:[Cc]|[Ss]|[Dd]|[Ww])\s*/\s*[Oo]"
 
 # Doctor names are protected spans: the detector sees them and then skips them.
-_DOCTOR_EN = re.compile(rf"(?<!\w){_DOCTOR}{_GAP}(?:{_EN_SEQ}|{_EN_WORD})")
+# The name after Dr. may be Hindi (Dr. रमेश शर्मा).
+_DOCTOR_EN = re.compile(rf"(?<!\w){_DOCTOR}{_GAP}(?:{_EN_SEQ}|{_EN_WORD}|{_HI_SEQ})")
 _DOCTOR_HI = re.compile(rf"(?:डॉ|डॉक्टर)\.?\s*{_HI_SEQ}")
 
 # Medicines and doses. These spans are never reported as personal information.
@@ -124,12 +121,19 @@ _NOT_NAMES = {
 }
 
 # Short Hindi words that join a sentence. They are not names.
+# Titles are included so श्री रमेश कुमार is stored as रमेश कुमार.
+# Clinical words are included so बुखार is not stored as a person.
 _HI_STOP = {
     "का", "की", "के", "को", "में", "से", "पर", "और", "या", "एक", "यह", "वह",
     "ये", "वे", "ने", "है", "हैं", "था", "थी", "थे", "हो", "नहीं", "नाम",
     "रोगी", "मरीज", "उम्र", "वर्ष", "साल", "दवा", "गोली", "तक", "लिए",
     "गया", "गई", "किया", "दिया", "रहा", "रही", "रहे", "तथा", "लेकिन", "अगर",
     "जब", "तब", "भी", "ही", "तो", "डॉ", "डॉक्टर", "का",
+    "श्री", "श्रीमती", "कुमारी", "जी", "साहब", "साहिब", "दीदी",
+    "बुखार", "बुख़ार", "ज्वर", "दर्द", "खाँसी", "खांसी", "सिर", "पेट",
+    "शुगर", "सुगर", "मधुमेह", "रक्तचाप", "बीपी", "पार्किंसन", "पार्किन्सन",
+    "डोलो", "रामिप्रिल", "चक्कर", "उल्टी", "दस्त", "जुकाम", "दवाई",
+    "कैंसर", "मलेरिया", "डेंगू", "टाइफाइड", "कमजोरी", "संक्रमण", "सांस",
 }
 
 _BLANK = {"na", "n/a", "nil", "null", "none", "-", "--"}
@@ -187,40 +191,57 @@ _PRIORITY = {
 }
 
 
+# Stop walking before Python's recursion limit. A hospital export can nest
+# hundreds of objects (misc/deep_export.json). Deeper leaves are left unscanned
+# so the process does not raise RecursionError.
+_MAX_DEPTH = 128
+
+
 def find_personal_info(records: list[dict] | str) -> list[dict]:
     """Return personal information found in records or in one text string.
 
     Each item is a dictionary with type, text, record, and field. Hindi names
-    also include latin when indic-transliteration is available. A relative
-    name includes cue, such as "S/o".
+    also include latin, the plain spelling (रमेश कुमार -> ramesh kumar).
+    A relative name includes cue, such as "S/o". A tag on a medical term
+    is cancelled.
     """
     if isinstance(records, str):
         found = _scan(records, 0, "")
     else:
         found = []
         for index, record in enumerate(records):
-            if isinstance(record, str):
-                found.extend(_scan(record, index, ""))
+            try:
+                found.extend(_find_in_record(record, index))
+            except RecursionError:
                 continue
-            if not isinstance(record, dict):
-                continue
-            for field, text in _walk(record):
-                found.extend(_scan(text, index, field))
     found.sort(key=lambda item: (item["record"], item["field"], item["start"]))
     return [_public(item) for item in found]
 
 
-def _walk(value: object, prefix: str = ""):
+def _find_in_record(record: object, index: int) -> list[dict]:
+    if isinstance(record, str):
+        return _scan(record, index, "")
+    if not isinstance(record, dict):
+        return []
+    found: list[dict] = []
+    for field, text in _walk(record):
+        found.extend(_scan(text, index, field))
+    return found
+
+
+def _walk(value: object, prefix: str = "", depth: int = 0):
     """Yield (field path, text) for every leaf in a record."""
+    if depth > _MAX_DEPTH:
+        return
     if isinstance(value, dict):
         for key, item in value.items():
             path = f"{prefix}.{key}" if prefix else str(key)
-            yield from _walk(item, path)
+            yield from _walk(item, path, depth + 1)
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
             path = f"{prefix}[{index}]" if prefix else f"[{index}]"
-            yield from _walk(item, path)
+            yield from _walk(item, path, depth + 1)
         return
     text = _as_text(value)
     if text and text.strip():
@@ -266,6 +287,9 @@ def _scan(text: str, record: int, field: str) -> list[dict]:
 
     found.extend(_contact_ids(text, record, field))
     found = [item for item in found if _keep_name(item, protected)]
+    # A protect-list tag is not personal information, so it is dropped here
+    # before a longer medical span can crowd out a real name.
+    found = [item for item in found if not is_medical_span(item["text"])]
     return _resolve(found)
 
 
@@ -340,11 +364,13 @@ def _hindi_names(text: str, record: int, field: str) -> list[dict]:
             start = run.start() + group[0].start()
             end = run.start() + group[-1].end()
             name = text[start:end]
-            tokens = name.split()
             # A single Hindi word in a sentence is too easy to get wrong.
             # One-word names still match after C/O, S/o, D/o, W/o and in name fields.
-            if _plausible(tokens, allow_single=False):
-                found.append(_item("name", name, start, end, record, field))
+            kept = _clean_tokens(name.split(), allow_single=False)
+            if kept is not None:
+                located = _locate(name, start, kept)
+                if located is not None:
+                    found.append(_item("name", located[0], located[1], located[2], record, field))
             group.clear()
 
         for word in _HI_WORD_RE.finditer(run.group(0)):
@@ -415,7 +441,9 @@ def _clean_tokens(tokens: list[str], allow_single: bool) -> list[str] | None:
     # A token list that still contains "Dr" is a doctor name. Keep it.
     if any(_letters(token).lower() in {"dr", "doctor"} for token in tokens):
         return None
-    cleaned = list(tokens)
+    # Medical words are removed wherever they sit, so "Ramesh Kumar
+    # Parkinson's" stays a name and the disease is not part of it.
+    cleaned = [token for token in tokens if not is_medical_token(token)]
     while cleaned and _drop_token(cleaned[0]):
         cleaned.pop(0)
     while cleaned and _drop_token(cleaned[-1]):
@@ -474,23 +502,10 @@ def _item(
         "cue": cue,
     }
     if kind == "name" and _has_devanagari(text):
-        latin = _to_latin(text)
+        latin = to_latin(text).strip()
         if latin:
             item["latin"] = latin
     return item
-
-
-def _to_latin(hindi: str) -> str:
-    """Romanize a Hindi name. Empty when the library is not installed."""
-    if _transliterate is None or sanscript is None:
-        return ""
-    scheme = getattr(sanscript, "IAST", None)
-    if scheme is None:
-        return ""
-    try:
-        return _transliterate(hindi, sanscript.DEVANAGARI, scheme).strip()
-    except Exception:
-        return ""
 
 
 def _resolve(candidates: list[dict]) -> list[dict]:

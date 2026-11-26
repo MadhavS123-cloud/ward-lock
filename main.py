@@ -13,7 +13,6 @@ import json
 import shutil
 import sys
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -27,10 +26,9 @@ from privacy.assess import assess
 from privacy.generalize import generalize
 from sanitizer import sanitize
 from utils.config import load_policy
-from utils.io import write_records, write_shaped
+from utils.io import write_shaped
 
 POLICY_PATH = ROOT / "config" / "policy.yaml"
-_SUPPORTED = {".json", ".jsonl", ".csv"}
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -45,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--input",
         required=True,
         type=Path,
-        help="Folder of local records (.json, .jsonl, or .csv).",
+        help="Folder of local records. Unsupported types are quarantined.",
     )
     parser.add_argument(
         "--output",
@@ -57,7 +55,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_pipeline(input_path: Path, output_path: Path) -> None:
-    started = datetime.now(timezone.utc)
     clock = time.perf_counter()
 
     root = input_path.resolve()
@@ -71,32 +68,39 @@ def run_pipeline(input_path: Path, output_path: Path) -> None:
     loaded: list[dict] = []
     combined: list[dict] = []
     spans: list[tuple[int, int]] = []
+    quarantined_files = 0
     for path, relative in sources:
-        item = read_file(path)
+        try:
+            item = read_file(path)
+        except RecursionError:
+            item = {
+                "sha256": None,
+                "encoding": None,
+                "shape": "",
+                "records": [],
+                "quarantined": True,
+                "reason": "JSON nesting is too deep",
+            }
         item["relative"] = relative
         start = len(combined)
         if not item["quarantined"]:
             combined.extend(item["records"])
+        else:
+            quarantined_files += 1
         spans.append((start, len(combined)))
         loaded.append(item)
-        if item["quarantined"]:
-            print(f"[ingestion] quarantined {relative}: {item['reason']}")
-        else:
-            print(
-                f"[ingestion] {relative}: {len(item['records'])} record(s) "
-                f"encoding={item['encoding']} sha256={item['sha256']}"
-            )
 
     # One list, so the same person in two files shares one patient id.
+    # Counts only. Record text is personal information and stays off stdout.
     found = find_personal_info(combined)
-    _report_findings(found)
+    print(f"[ingestion] {len(loaded)} file(s), {quarantined_files} quarantined")
+    print(f"[detection] {len(found)} personal item(s)")
 
     if combined:
         combined = assign_patients(combined, found)
         linked = sum(1 for record in combined if isinstance(record, dict) and record.get("patient"))
         print(f"[linkage] {linked} patient id(s), {len(combined) - linked} left unset")
         combined = generalize(combined)
-        print("[privacy] shifted dates by patient and banded ages")
         policy = load_policy(POLICY_PATH)
         combined = assess(combined, policy)
         combined = sanitize(combined, found, policy)
@@ -106,15 +110,19 @@ def run_pipeline(input_path: Path, output_path: Path) -> None:
         print("[linkage] 0 patient id(s), 0 left unset")
         print("[sanitizer] removed 0 personal item(s)")
 
-    _write_output(output, loaded, spans, combined, found, started, clock)
-    print(f"[ward-lock] wrote {output}")
+    _write_output(output, loaded, spans, combined, found, clock)
+    print("[ward-lock] finished")
 
 
 def _input_files(root: Path, output: Path) -> list[tuple[Path, str]]:
-    """Supported files under the input folder, in a stable order."""
+    """Every file under the input folder, in a stable order.
+
+    JSON, JSONL, and CSV are sanitized. Anything else is still listed so the
+    reader can quarantine it and the report can name it.
+    """
     found: list[tuple[Path, str]] = []
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in _SUPPORTED:
+        if not path.is_file():
             continue
         resolved = path.resolve()
         # A previous output folder sitting inside the input is not a source.
@@ -131,7 +139,6 @@ def _write_output(
     spans: list[tuple[int, int]],
     combined: list[dict],
     found: list[dict],
-    started: datetime,
     clock: float,
 ) -> None:
     """Write sanitized/, records.jsonl, and report.json."""
@@ -140,45 +147,62 @@ def _write_output(
         shutil.rmtree(sanitized_root)
     sanitized_root.mkdir(parents=True, exist_ok=True)
 
-    hits = _hits_by_file(spans, found)
-    flat: list[dict] = []
+    index_rows: list[dict] = []
     file_reports: list[dict] = []
+    sanitized_count = 0
     for index, item in enumerate(loaded):
         start, end = spans[index]
-        records = [] if item["quarantined"] else combined[start:end]
-        flat.extend(records)
+        quarantined = bool(item["quarantined"])
+        records = [] if quarantined else combined[start:end]
         entry = {
             "path": item["relative"],
-            "sha256": item["sha256"],
+            "input_sha256": item["sha256"],
+            "output": None,
+            "status": "quarantined" if quarantined else "sanitized",
             "records": len(records),
-            "personal_items": hits[index],
-            "quarantined": bool(item["quarantined"]),
         }
-        if item["quarantined"]:
+        if quarantined:
             entry["reason"] = item["reason"]
         else:
-            dest = sanitized_root / item["relative"]
-            entry["sanitized"] = "sanitized/" + item["relative"]
-            entry["sanitized_sha256"] = write_shaped(records, dest, item.get("shape") or "")
+            dest_rel = "sanitized/" + item["relative"]
+            entry["output"] = dest_rel
+            try:
+                entry["output_sha256"] = write_shaped(
+                    records, sanitized_root / item["relative"], item.get("shape") or ""
+                )
+            except RecursionError:
+                entry["status"] = "quarantined"
+                entry["output"] = None
+                entry["records"] = 0
+                entry["reason"] = "JSON nesting is too deep"
+                records = []
+            else:
+                sanitized_count += 1
+                for offset, record in enumerate(records):
+                    index_rows.append(
+                        {
+                            "file": item["relative"],
+                            "loc": str(offset),
+                            "patient": _patient_id(record),
+                        }
+                    )
         file_reports.append(entry)
 
-    write_records(flat, output / "records.jsonl")
+    _write_index(index_rows, output / "records.jsonl")
 
-    linked = sum(1 for record in flat if isinstance(record, dict) and record.get("patient"))
-    finished = datetime.now(timezone.utc)
+    linked = sum(1 for row in index_rows if row["patient"])
+    quarantined_count = len(loaded) - sanitized_count
     report = {
-        "timing": {
-            "started": started.isoformat(),
-            "finished": finished.isoformat(),
-            "elapsed_seconds": round(time.perf_counter() - clock, 3),
-        },
+        "timing": {"seconds": round(time.perf_counter() - clock, 3)},
+        "resources": {"peak_rss_mb": _peak_rss_mb()},
         "counts": {
-            "files": len(loaded),
-            "records": len(flat),
-            "quarantined": sum(1 for item in loaded if item["quarantined"]),
+            "files_total": len(loaded),
+            "files_sanitized": sanitized_count,
+            "files_quarantined": quarantined_count,
+            "records_processed": len(index_rows),
+            "records_linked": linked,
+            "records_unlinked": len(index_rows) - linked,
             "personal_items": len(found),
-            "linked": linked,
-            "unlinked": len(flat) - linked,
         },
         "files": file_reports,
     }
@@ -190,36 +214,76 @@ def _write_output(
     )
 
 
-def _hits_by_file(spans: list[tuple[int, int]], found: list[dict]) -> list[int]:
-    counts = [0] * len(spans)
-    for item in found:
-        record_index = int(item.get("record", -1))
-        for file_index, (start, end) in enumerate(spans):
-            if start <= record_index < end:
-                counts[file_index] += 1
-                break
-    return counts
+def _patient_id(record: object) -> str | None:
+    """Pseudonym only. Missing and blank ids are null in the index."""
+    if not isinstance(record, dict):
+        return None
+    patient = record.get("patient")
+    if isinstance(patient, str) and patient.strip():
+        return patient.strip()
+    return None
 
 
-def _report_findings(found: list[dict]) -> None:
-    print(f"[detection] {len(found)} personal item(s)")
-    for item in found:
-        parts = [f"{item['type']}:"]
-        if item.get("cue"):
-            parts.append(item["cue"])
-        parts.append(item["text"])
-        if item.get("latin"):
-            parts.append(f"[{item['latin']}]")
-        if item.get("field"):
-            parts.append(f"({item['field']})")
-        _emit("[detection] " + " ".join(parts))
+def _write_index(rows: list[dict], path: Path) -> None:
+    """One index line per record: file, loc, and patient. Not the record body."""
+    lines = [
+        json.dumps(
+            {"file": row["file"], "loc": row["loc"], "patient": row["patient"]},
+            ensure_ascii=False,
+        )
+        for row in rows
+    ]
+    text = ("\n".join(lines) + "\n") if lines else ""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
 
 
-def _emit(message: str) -> None:
-    """Print text that may contain Hindi on a console that is not UTF-8."""
-    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
-    safe = message.encode(encoding, errors="replace").decode(encoding, errors="replace")
-    print(safe)
+def _peak_rss_mb() -> float:
+    """Highest resident memory of this process, in megabytes."""
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # macOS reports bytes. Linux reports kilobytes.
+        if sys.platform == "darwin":
+            return round(peak / (1024 * 1024), 3)
+        return round(peak / 1024, 3)
+    except Exception:
+        pass
+    if sys.platform != "win32":
+        return 0.0
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(_Counters)
+        # argtypes are required. Without them the 64-bit call fails and the
+        # peak stays zero.
+        kernel = ctypes.windll.kernel32
+        process = kernel.GetCurrentProcess()
+        info = ctypes.windll.psapi.GetProcessMemoryInfo
+        info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+        info.restype = wintypes.BOOL
+        if info(process, ctypes.byref(counters), counters.cb):
+            return round(counters.PeakWorkingSetSize / (1024 * 1024), 3)
+    except Exception:
+        pass
+    return 0.0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -228,6 +292,9 @@ def main(argv: list[str] | None = None) -> int:
         run_pipeline(args.input, args.output)
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 1
+    except RecursionError:
+        print("error: input nesting is too deep", file=sys.stderr)
         return 1
     return 0
 

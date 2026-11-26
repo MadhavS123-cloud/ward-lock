@@ -50,6 +50,9 @@ _AGE_PHRASE = re.compile(
 _AGE_NUMBER = re.compile(r"\b(\d{1,3})\b")
 _ALREADY_BAND = re.compile(r"\d{1,3}-\d{1,3}")
 
+# Stop before Python's recursion limit. Deeper values are copied unchanged.
+_MAX_DEPTH = 128
+
 
 def generalize(records: list[dict]) -> list[dict]:
     """Return copies with shifted dates and banded ages."""
@@ -63,10 +66,13 @@ def generalize(records: list[dict]) -> list[dict]:
         if not isinstance(record, dict):
             output.append(record)
             continue
-        key = _shift_key(record)
-        if key not in shifts:
-            shifts[key] = _shift_days(secret, key)
-        output.append(_apply(record, shifts[key]))
+        try:
+            key = _shift_key(record)
+            if key not in shifts:
+                shifts[key] = _shift_days(secret, key)
+            output.append(_apply(record, shifts[key]))
+        except RecursionError:
+            output.append(record)
     return output
 
 
@@ -95,15 +101,19 @@ def _apply(record: dict, days: int) -> dict:
     return {key: _apply_value(value, str(key), days) for key, value in record.items()}
 
 
-def _apply_value(value: object, field: str, days: int) -> object:
+def _apply_value(value: object, field: str, days: int, depth: int = 0) -> object:
+    if depth > _MAX_DEPTH:
+        return value
     leaf = _leaf(field)
     # Medicines, doses, vitals, and diagnoses are clinical. Leave them alone.
     if leaf and _is_clinical(leaf):
         return value
     if isinstance(value, dict):
-        return {key: _apply_value(item, str(key), days) for key, item in value.items()}
+        return {
+            key: _apply_value(item, str(key), days, depth + 1) for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_apply_value(item, field, days) for item in value]
+        return [_apply_value(item, field, days, depth + 1) for item in value]
     if leaf in _AGE_FIELDS:
         return _band_age_value(value)
     if isinstance(value, str):
@@ -207,17 +217,19 @@ def _render(match: re.Match, kind: str, days: int) -> str:
 def _date_texts(record: dict) -> list[str]:
     found: list[str] = []
 
-    def walk(value: object, field: str) -> None:
+    def walk(value: object, field: str, depth: int = 0) -> None:
+        if depth > _MAX_DEPTH:
+            return
         leaf = _leaf(field) if field else ""
         if leaf and _is_clinical(leaf):
             return
         if isinstance(value, dict):
             for key, item in value.items():
-                walk(item, str(key))
+                walk(item, str(key), depth + 1)
             return
         if isinstance(value, list):
             for item in value:
-                walk(item, field)
+                walk(item, field, depth + 1)
             return
         if isinstance(value, str):
             found.extend(match.group(0) for match in _YMD.finditer(value))

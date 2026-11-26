@@ -1,6 +1,5 @@
 # Local parsing only. No language-model clients, GPU frameworks, or HTTP libraries.
 PyYAML>=6.0.2
-# Optional, offline Hindi name romanization. Detection still runs if this is absent.
-indic-transliteration>=2.3.0
 # Local fuzzy name matching. No network calls.
+# Hindi names are romanized in utils/translit.py. No extra package.
 rapidfuzz>=3.0.0

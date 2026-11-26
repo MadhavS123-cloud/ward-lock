@@ -75,6 +75,8 @@ def read_file(path: Path) -> dict:
         else:
             result["records"] = _parse_csv(text)
             result["shape"] = "csv"
+    except RecursionError:
+        return _quarantine(result, "JSON nesting is too deep")
     except (ValueError, csv.Error):
         return _quarantine(result, f"invalid {suffix[1:]} file")
 

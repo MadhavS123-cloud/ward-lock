@@ -10,25 +10,23 @@ patient stays null.
 from __future__ import annotations
 
 import re
-import unicodedata
 
 from rapidfuzz import fuzz
 
 from pseudonym.hmac import patient_id
-
-try:
-    from indic_transliteration import sanscript
-    from indic_transliteration.sanscript import transliterate as _transliterate
-except ImportError:  # Hindi names then keep only their Latin letters
-    sanscript = None
-    _transliterate = None
+from utils.translit import to_latin
 
 # rapidfuzz token scores are 0-100. 80 links a person. 70-80 is too close to guess.
 _MATCH = 80
 _WEAK = 70
 
-# Honorifics, including the Latin form साहब gets from transliteration (sahaba).
-_HONORIFICS = {"ji", "sahab", "sahib", "sahaba", "didi"}
+# Titles are not part of the name. श्री रमेश कुमार and Ramesh Kumar share one id.
+# sahaba is the old transliteration of साहब; sahab is the plain spelling.
+_HONORIFICS = {
+    "ji", "sahab", "sahib", "sahaba", "didi",
+    "shri", "shree", "sri", "smt", "shrimati", "kumari",
+    "mr", "mrs", "ms", "miss", "master",
+}
 
 # These are not the patient's own name.
 _RELATIVE_CUES = {"C/O", "S/O", "D/O", "W/O"}
@@ -41,8 +39,11 @@ _SKIP_FIELDS = {
 
 
 def normalize_name(name: str) -> str:
-    """Lowercase a name, transliterate Hindi, and drop ji/sahab/didi."""
-    text = _to_latin(name.strip()).lower()
+    """Lowercase a name, transliterate Hindi, and drop ji/shri/sahab.
+
+    रमेश कुमार and Ramesh Kumar both become ramesh kumar, so they share one id.
+    """
+    text = to_latin(name.strip()).lower()
     text = re.sub(r"[^a-z\s]", " ", text)
     tokens = [token for token in text.split() if token not in _HONORIFICS]
     return " ".join(tokens)
@@ -261,21 +262,6 @@ def _cluster(
     for index in active:
         groups.setdefault(find(index), []).append(index)
     return groups
-
-
-def _to_latin(text: str) -> str:
-    """Romanize Devanagari and drop accent marks so fuzzy match sees ASCII."""
-    if not re.search(r"[\u0900-\u097F]", text):
-        return text
-    if _transliterate is None or sanscript is None:
-        return re.sub(r"[\u0900-\u097F]+", " ", text)
-    try:
-        latin = _transliterate(text, sanscript.DEVANAGARI, sanscript.IAST)
-    except Exception:
-        # Keep going with the Latin letters. A transliteration miss is not fatal.
-        return re.sub(r"[\u0900-\u097F]+", " ", text)
-    plain = unicodedata.normalize("NFD", latin)
-    return "".join(char for char in plain if not unicodedata.combining(char))
 
 
 def _leaf(field: str) -> str:
