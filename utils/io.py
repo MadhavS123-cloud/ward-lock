@@ -37,27 +37,51 @@ def write_records(records: list[dict], path: Path) -> None:
     target.write_bytes(_render(records, suffix, shape))
 
 
-def write_shaped(records: list[dict], path: Path, shape: str) -> str:
+def write_shaped(
+    records: list[dict],
+    path: Path,
+    shape: str,
+    shell: dict | None = None,
+    split_key: str | None = None,
+    delimiter: str = ",",
+) -> str:
     """Write records in the container the reader saw.
 
-    ``shape`` is object, list, records, jsonl, or csv. Returns the SHA-256
-    hex digest of the bytes written.
+    ``shape`` is object, list, records, split, jsonl, csv, tsv, or text.
+    Returns the SHA-256 hex digest of the bytes written.
     """
     target = path.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    data = _render(records, target.suffix.lower(), shape)
+    data = _render(records, target.suffix.lower(), shape, shell, split_key, delimiter)
     target.write_bytes(data)
     return hashlib.sha256(data).hexdigest()
 
 
-def _render(records: list[dict], suffix: str, shape: str) -> bytes:
+def _render(
+    records: list[dict],
+    suffix: str,
+    shape: str,
+    shell: dict | None = None,
+    split_key: str | None = None,
+    delimiter: str = ",",
+) -> bytes:
     """Serialize records. A single JSON object stays an object."""
+    if shape == "text":
+        body = ""
+        if records and isinstance(records[0], dict):
+            body = str(records[0].get("text") or "")
+        return body.encode("utf-8")
+    if shape == "split" and split_key:
+        document = dict(shell or {})
+        document[split_key] = records
+        return _json_bytes(document)
     if shape == "object" and len(records) == 1:
         return _json_bytes(records[0])
     if shape == "records":
         return _json_bytes({"records": records})
-    if shape == "csv" or suffix == ".csv":
-        return _csv_bytes(records)
+    if shape in {"csv", "tsv"} or suffix in {".csv", ".tsv"}:
+        sep = "\t" if shape == "tsv" or suffix == ".tsv" else delimiter
+        return _csv_bytes(records, sep)
     if shape == "jsonl" or suffix == ".jsonl":
         return _jsonl_bytes(records)
     return _json_bytes(records)
@@ -75,7 +99,7 @@ def _jsonl_bytes(records: list[dict]) -> bytes:
     return text.encode("utf-8")
 
 
-def _csv_bytes(records: list[dict]) -> bytes:
+def _csv_bytes(records: list[dict], delimiter: str = ",") -> bytes:
     fieldnames: list[str] = []
     seen: set[str] = set()
     for record in records:
@@ -84,7 +108,13 @@ def _csv_bytes(records: list[dict]) -> bytes:
                 seen.add(key)
                 fieldnames.append(key)
     buffer = io.StringIO(newline="")
-    writer = csv.DictWriter(buffer, fieldnames=fieldnames, extrasaction="ignore")
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=fieldnames,
+        extrasaction="ignore",
+        delimiter=delimiter,
+        lineterminator="\n",
+    )
     writer.writeheader()
     for record in records:
         writer.writerow({key: _csv_cell(record.get(key, "")) for key in fieldnames})

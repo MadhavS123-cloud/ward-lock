@@ -30,7 +30,7 @@ _TERMS = {
     "hepatitis", "jaundice", "cirrhosis",
     "diarrhea", "diarrhoea", "dysentery", "constipation", "vomiting",
     "nausea", "acidity", "gastritis", "gerd", "ulcer",
-    "cough", "cold", "pain", "headache", "bodyache", "weakness",
+    "cough", "cold", "pain", "abdomen", "abdominal", "headache", "bodyache", "weakness",
     "dizziness", "chakkar", "khansi", "dard", "darda",
     "infection", "inflammation", "sepsis", "allergy",
     "fracture", "injury", "wound",

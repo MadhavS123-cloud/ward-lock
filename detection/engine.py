@@ -13,6 +13,8 @@ Hindi names are romanized locally: रमेश कुमार becomes ramesh k
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 
 from utils.medical import is_medical_span, is_medical_token
@@ -72,9 +74,17 @@ _MEDICINE = re.compile(
 )
 
 _EMAIL = re.compile(r"(?<![\w.])[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}(?!\w)")
+# Consent scans and similar attachments hide a name inside base64.
+_B64 = re.compile(r"(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/])")
+# Devanagari digits count as digits. ६ is U+096C.
+_ND = r"0-9\u0966-\u096F"
+_N6 = r"6-9\u096C-\u096F"
+_DEV_DIGIT = str.maketrans("०१२३४५६७८९", "0123456789")
 # Optional +91 or a leading 0, then a 10-digit mobile. Spaces and hyphens may
-# sit between the digits: 98765 43210, +91-9876543210.
-_MOBILE = re.compile(r"(?<!\d)(?:\+?\s*91[\s\-]?|0)?[6-9](?:[\s\-]?\d){9}(?!\d)")
+# sit between the digits: 98765 43210, +91-9876543210. Devanagari digits count.
+_MOBILE = re.compile(
+    rf"(?<![{_ND}])(?:\+?\s*91[\s\-]?|0)?[{_N6}](?:[\s\-]?[{_ND}]){{9}}(?![{_ND}])"
+)
 # STD landline with a separator, for example 011-23456789.
 _LANDLINE = re.compile(r"(?<!\d)0\d{2,4}[\s\-]\d{6,8}(?!\d)")
 _AADHAAR = re.compile(r"(?<!\d)(?:\d{4}[\s\-]\d{4}[\s\-]\d{4}|\d{12})(?!\d)")
@@ -89,13 +99,67 @@ _UHID = re.compile(
 _MRN = re.compile(
     r"(?<!\w)" + _fold("MRN") + r"[\s:.#\-/]{0,5}([A-Za-z0-9][A-Za-z0-9/\-]{3,23})"
 )
+# Hospital ids with no "UHID" or "MRN" label: JJH-0077112, SNJ/26/064511,
+# IPD-2026-00432, UHID-010607, ADM000162, adm000161, DHH-IPD-00591.
+_MRN_TOKEN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"[A-Za-z]{2,5}-[A-Za-z]{2,5}-\d{4,8}"
+    r"|[A-Za-z]{2,5}-\d{2,4}-\d{4,6}"
+    r"|[A-Za-z]{2,5}/\d{2}/\d{4,8}"
+    r"|[A-Za-z]{2,5}\d{4}-\d{5,8}"
+    r"|[A-Za-z]{2,5}-\d{5,8}"
+    r"|[A-Za-z]{3,5}\d{6,8}"
+    r")(?![A-Za-z0-9])"
+)
+# ABCDE1234F, including a lowercase copy of the same shape.
+_PAN = re.compile(r"(?i)(?<![A-Za-z0-9])[A-Z]{5}\d{4}[A-Z](?![A-Za-z0-9])")
+_INSURANCE = re.compile(
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"PMJAY-[A-Z]{2}-\d{8,14}"
+    r"|POL/\d{2}/\d{6,12}"
+    r"|(?:CGHS|ESIS|ECHS)[-/][A-Z0-9][A-Z0-9/-]{5,24}"
+    r")(?![A-Za-z0-9])"
+)
+# "PIN 226010" or "postal code: 226010". The digits are the personal part.
+_PIN_LABEL = re.compile(
+    r"(?i)(?<![A-Za-z])(?:pin(?:\s*code)?|pincode|postal(?:\s*code)?|zip(?:\s*code)?)"
+    r"\s*[:#\-]?\s*([1-9]\d{5})\b"
+)
+# "Distt. Sitapur - 261167" and the Hindi line that ends the same way.
+_PIN_ADDR = re.compile(
+    r"(?im)^(?=.*(?:\bdistt?\.?\b|\bdistrict\b|जिला|\btehsil\b|तहसील|\bgram\b|ग्राम"
+    r"|\bvill\.?\b|mohalla|मोहल्ला|पता|\baddress\b)).{0,300}?[-\u2013]\s*([1-9]\d{5})\b"
+)
 _RELATIVE_NAME = re.compile(
     rf"(?<!\w)({_RELATIVE})\s+({_LOOSE_SEQ}|{_HI_SEQ})"
 )
 _TITLE_NAME = re.compile(rf"(?<!\w)({_TITLES}){_GAP}({_EN_SEQ}|{_EN_WORD}|{_HI_SEQ})")
 _EN_NAME = re.compile(rf"\b({_EN_SEQ})\b")
+# "Asha ji", "Reena behenji", "Shahid sahab". Longest honorific first.
+_HONORIFIC = (
+    r"behenji|bhaiya|bhaisaab|bhaisahab|chachu|chacha|sahab|sahib|behen|bhai|"
+    r"didi|babu|amma|mama|papa|kaka|kaki|bhabhi|beta|beti|ji"
+)
+_HINGLISH_NAME = re.compile(
+    rf"(?<![A-Za-z])([A-Z][A-Za-z'\-]{{1,}}(?:\s+[A-Z][A-Za-z'\-]{{1,}}){{0,2}})"
+    rf"\s+((?i:{_HONORIFIC}))\b"
+)
+# "Asha, W/o Kamal" — the name sits before the relation, not after it.
+_BEFORE_REL = re.compile(
+    rf"(?<![A-Za-z])([A-Z][A-Za-z'\-]{{2,}})\s*,\s*(?={_RELATIVE}\b)"
+)
+# Anita_Sharma in a path or a file name. Both parts must look like names.
+_US_NAME = re.compile(r"(?<![A-Za-z])([A-Z][a-z]+(?:_[A-Z][a-z]+)+)(?![A-Za-z])")
+# Shahid_NA_010607 and Reena_Nishad. A kept folder word is not a person.
+_PATH_NAME = re.compile(r"(?:(?<=\\)|(?<=/)|(?<=_))([A-Z][a-z]{2,})(?=_|\\|/|\d)")
+_PATH_ID = re.compile(r"(?<=_)\d{6,8}(?!\d)")
 _HI_RUN = re.compile(rf"{_HI_WORD}(?:\s+{_HI_WORD})*")
 _HI_WORD_RE = re.compile(_HI_WORD)
+# Kinship words name a relative. ji, sahab, bhai, didi name the patient.
+_KIN = {
+    "bhaiya", "bhaisaab", "bhaisahab", "chachu", "chacha", "mama", "papa",
+    "kaka", "kaki", "bhabhi",
+}
 
 # Clinical words that look like capitalized names but are not people.
 _NOT_NAMES = {
@@ -118,6 +182,21 @@ _NOT_NAMES = {
     "the", "for", "was", "has", "his", "her", "age", "sex",
     "is", "are", "of", "on", "in", "to", "at", "by", "as", "be", "or",
     "pt", "yrs", "yo",
+    "pin", "code", "pincode", "zip", "postal", "post",
+    "name", "relative", "guardian", "father", "mother", "spouse", "husband",
+    "wife", "attendant", "mobile", "phone", "contact", "email", "address",
+    "village", "district", "tehsil", "gender", "relation", "reg", "dob",
+    "uhid", "abha", "aadhaar", "aadhar", "number", "no", "id", "notes",
+    "first", "last", "city", "street", "state", "age", "sex", "date",
+    "abdomen", "abdominal", "chest", "breathlessness", "swelling", "burning",
+    "itching", "giddiness", "nausea", "motions", "stool", "urine", "trauma",
+    "allergy", "allergic", "sulfa", "stable", "condition", "discharged",
+    "treated", "essential", "primary", "summary", "nursing", "export",
+    "exports", "visits", "registration", "forward", "index", "results",
+    "claims", "patients", "bundle", "protocol", "formulary", "reference",
+    "ranges", "census", "sheet", "log", "note", "notes", "lab", "city",
+    "billing", "fhir", "misc", "clean", "prescriptions", "discharge",
+    "report", "whatsapp", "sanjeevani", "arogya", "jeevanjyoti", "dhhardoi",
 }
 
 # Short Hindi words that join a sentence. They are not names.
@@ -163,11 +242,35 @@ _ID_KEYS = {
     "abhano": "abha",
     "abhanumber": "abha",
     "abhaid": "abha",
+    "pan": "pan",
+    "panno": "pan",
+    "pannumber": "pan",
+    "payerpan": "pan",
+    "pancard": "pan",
+    "panid": "pan",
+    "pin": "pin",
+    "pincode": "pin",
+    "zip": "pin",
+    "zipcode": "pin",
+    "postalcode": "pin",
+    "postcode": "pin",
+    "pmjay": "insurance",
+    "pmjayid": "insurance",
+    "policyno": "insurance",
+    "policynumber": "insurance",
+    "policyid": "insurance",
+    "insurance": "insurance",
+    "insuranceid": "insurance",
+    "insuranceno": "insurance",
+    "memberid": "insurance",
+    "tpaid": "insurance",
 }
 _NAME_KEYS = {
     "patientname", "guardianname", "fathername", "mothername", "spousename",
     "husbandname", "wifename", "relativename", "attendantname", "fullname",
     "name", "patient",
+    "firstname", "lastname", "middlename", "surname", "givenname", "familyname",
+    "first", "last", "given", "family", "naam", "local",
 }
 # doctor_name is kept, the same way a name after "Dr." is kept.
 _DOCTOR_KEYS = {
@@ -185,9 +288,25 @@ _PRIORITY = {
     "abha": 1,
     "uhid": 2,
     "mrn": 2,
+    "insurance": 2,
+    "pan": 2,
     "aadhaar": 3,
     "phone": 4,
-    "name": 5,
+    "pin": 5,
+    "name": 6,
+}
+
+# A single Hindi word followed by one of these is still a name: रमेश जी.
+_HI_HONORIFIC = {
+    "जी", "साहब", "साहिब", "दीदी", "भाई", "बहन", "बहिन", "बाबू",
+    "अम्मा", "पापा", "मामा", "चाचा", "चाची", "भैया",
+}
+
+# Letter prefixes that look like an id but are a dose or a lab token.
+_MRN_BLOCK = {
+    "tab", "tablet", "cap", "capsule", "inj", "injection", "syp", "syrup",
+    "mg", "ml", "bp", "hr", "od", "bd", "tds", "hs", "sos", "prn", "stat",
+    "covid", "hba", "ldl", "hdl", "rbs", "cbc", "wbc", "rbc", "plt",
 }
 
 
@@ -216,6 +335,46 @@ def find_personal_info(records: list[dict] | str) -> list[dict]:
                 continue
     found.sort(key=lambda item: (item["record"], item["field"], item["start"]))
     return [_public(item) for item in found]
+
+
+def mask_personal_text(text: str) -> str:
+    """Blank personal text in a file name, a JSON key, or a CSV header.
+
+    A clean label is returned unchanged. When an id is present, a given name
+    written beside it is blanked too, as in "JJH-0077112 Zainab".
+    """
+    if not text:
+        return text
+    try:
+        found = _scan(text, 0, "label")
+    except RecursionError:
+        return text
+    spans = [(item["start"], item["end"]) for item in found]
+    id_types = {
+        "pan", "phone", "aadhaar", "abha", "uhid", "mrn", "pin",
+        "insurance", "email", "attachment",
+    }
+    if any(item["type"] in id_types for item in found):
+        for match in re.finditer(r"[A-Z][a-zA-Z]{2,}", text):
+            if match.group(0).lower() in _NOT_NAMES:
+                continue
+            spans.append((match.start(), match.end()))
+    if not spans:
+        return text
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            continue
+        merged.append((start, end))
+    parts: list[str] = []
+    cursor = 0
+    for start, end in merged:
+        parts.append(text[cursor:start])
+        parts.append("REDACTED")
+        cursor = end
+    parts.append(text[cursor:])
+    return "".join(parts)
 
 
 def _find_in_record(record: object, index: int) -> list[dict]:
@@ -260,7 +419,14 @@ def _as_text(value: object) -> str | None:
     return None
 
 
-def _scan(text: str, record: int, field: str) -> list[dict]:
+def _scan(text: str, record: int, field: str, encoded: bool = True) -> list[dict]:
+    found = _scan_surface(text, record, field)
+    if encoded:
+        found.extend(_encoded_attachments(text, record, field))
+    return _resolve(found)
+
+
+def _scan_surface(text: str, record: int, field: str) -> list[dict]:
     leaf = _leaf(field)
     protected = _protected_spans(text)
     # Doctor columns and pure drug columns are not name sources.
@@ -274,7 +440,7 @@ def _scan(text: str, record: int, field: str) -> list[dict]:
             start = text.find(value)
             found.append(_item(kind, value, start, start + len(value), record, field))
 
-    if not skip_names and leaf in _NAME_KEYS:
+    if not skip_names and _is_name_leaf(leaf):
         plain = _plain_name(text, protected)
         if plain is not None:
             name, start, end = plain
@@ -283,14 +449,43 @@ def _scan(text: str, record: int, field: str) -> list[dict]:
     if not skip_names:
         found.extend(_prefixed_names(text, record, field))
         found.extend(_english_names(text, record, field))
+        found.extend(_hinglish_names(text, record, field))
+        found.extend(_path_names(text, record, field))
         found.extend(_hindi_names(text, record, field))
 
     found.extend(_contact_ids(text, record, field))
     found = [item for item in found if _keep_name(item, protected)]
     # A protect-list tag is not personal information, so it is dropped here
     # before a longer medical span can crowd out a real name.
-    found = [item for item in found if not is_medical_span(item["text"])]
-    return _resolve(found)
+    return [item for item in found if not is_medical_span(item["text"])]
+
+
+def _encoded_attachments(text: str, record: int, field: str) -> list[dict]:
+    """Replace a base64 blob when the decoded text itself has personal data."""
+    found = []
+    for match in _B64.finditer(text):
+        plain = _decode_b64(match.group(0))
+        if not plain or not plain.strip():
+            continue
+        if not _scan(plain, record, field, encoded=False):
+            continue
+        found.append(
+            _item("attachment", match.group(0), match.start(), match.end(), record, field)
+        )
+    return found
+
+
+def _decode_b64(token: str) -> str | None:
+    """Decode one base64 token as UTF-8. Garbage bytes are not text."""
+    padded = token + ("=" * (-len(token) % 4))
+    try:
+        raw = base64.b64decode(padded, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeError:
+        return None
 
 
 def _protected_spans(text: str) -> list[tuple[int, int]]:
@@ -352,21 +547,66 @@ def _english_names(text: str, record: int, field: str) -> list[dict]:
     return found
 
 
+def _hinglish_names(text: str, record: int, field: str) -> list[dict]:
+    """Names with a spoken honorific, and a name written before W/o or S/o."""
+    found = []
+    for match in _HINGLISH_NAME.finditer(text):
+        kept = _clean_tokens(match.group(1).split(), allow_single=True)
+        if kept is None:
+            continue
+        honorific = match.group(2).lower()
+        cue = "KIN" if honorific in _KIN else ""
+        found.append(
+            _item("name", match.group(0), match.start(), match.end(), record, field, cue=cue)
+        )
+    for match in _BEFORE_REL.finditer(text):
+        word = match.group(1)
+        if _drop_token(word) or is_medical_token(word):
+            continue
+        found.append(_item("name", word, match.start(1), match.end(1), record, field))
+    for match in _US_NAME.finditer(text):
+        parts = match.group(1).split("_")
+        if not parts or all(part.lower() in _NOT_NAMES for part in parts):
+            continue
+        # Keep folder words such as Discharge_Summary and blank only the person.
+        base = match.start(1)
+        offset = 0
+        for part in parts:
+            if part.lower() not in _NOT_NAMES:
+                start = base + offset
+                found.append(_item("name", part, start, start + len(part), record, field))
+            offset += len(part) + 1
+    return found
+
+
+def _path_names(text: str, record: int, field: str) -> list[dict]:
+    """A path or a file name can carry a person and an id between underscores."""
+    found = []
+    for match in _PATH_NAME.finditer(text):
+        word = match.group(1)
+        if word.lower() in _NOT_NAMES or _drop_token(word):
+            continue
+        found.append(_item("name", word, match.start(1), match.end(1), record, field))
+    for match in _PATH_ID.finditer(text):
+        found.append(_item("mrn", match.group(0), match.start(), match.end(), record, field))
+    return found
+
+
 def _hindi_names(text: str, record: int, field: str) -> list[dict]:
     """Split a Hindi sentence on grammar words and keep the name pieces."""
     found = []
     for run in _HI_RUN.finditer(text):
         group: list[re.Match] = []
 
-        def flush() -> None:
+        def flush(allow_single: bool) -> None:
             if not group:
                 return
             start = run.start() + group[0].start()
             end = run.start() + group[-1].end()
             name = text[start:end]
             # A single Hindi word in a sentence is too easy to get wrong.
-            # One-word names still match after C/O, S/o, D/o, W/o and in name fields.
-            kept = _clean_tokens(name.split(), allow_single=False)
+            # जी / साहब, and C/O or a name field, are enough to keep one word.
+            kept = _clean_tokens(name.split(), allow_single=allow_single)
             if kept is not None:
                 located = _locate(name, start, kept)
                 if located is not None:
@@ -374,11 +614,15 @@ def _hindi_names(text: str, record: int, field: str) -> list[dict]:
             group.clear()
 
         for word in _HI_WORD_RE.finditer(run.group(0)):
-            if word.group(0) in _HI_STOP:
-                flush()
+            token = word.group(0)
+            if token in _HI_HONORIFIC:
+                flush(True)
+                continue
+            if token in _HI_STOP:
+                flush(False)
                 continue
             group.append(word)
-        flush()
+        flush(False)
     return found
 
 
@@ -400,6 +644,16 @@ def _contact_ids(text: str, record: int, field: str) -> list[dict]:
     for match in _MRN.finditer(text):
         if _id_token_ok(match.group(1)):
             found.append(_item("mrn", match.group(0), match.start(), match.end(), record, field))
+    for match in _MRN_TOKEN.finditer(text):
+        if _mrn_prefix_ok(match.group(0)):
+            found.append(_item("mrn", match.group(0), match.start(), match.end(), record, field))
+    for match in _PAN.finditer(text):
+        found.append(_item("pan", match.group(0), match.start(), match.end(), record, field))
+    for match in _INSURANCE.finditer(text):
+        found.append(_item("insurance", match.group(0), match.start(), match.end(), record, field))
+    for pattern in (_PIN_LABEL, _PIN_ADDR):
+        for match in pattern.finditer(text):
+            found.append(_item("pin", match.group(1), match.start(1), match.end(1), record, field))
     for match in _AADHAAR.finditer(text):
         digits = _digits(match.group(0))
         if len(digits) != 12 or len(set(digits)) == 1:
@@ -562,6 +816,19 @@ def _id_value_ok(kind: str, value: str) -> bool:
         return len(digits) == 14 and len(set(digits)) > 1
     if kind in {"uhid", "mrn"}:
         return _id_token_ok(value)
+    if kind == "pan":
+        return _PAN.fullmatch(re.sub(r"\s+", "", value)) is not None
+    if kind == "pin":
+        return len(digits) == 6 and digits[0] != "0" and len(set(digits)) > 1
+    if kind == "insurance":
+        compact = re.sub(r"\s+", "", value)
+        if _INSURANCE.search(compact):
+            return True
+        return (
+            " " not in value.strip()
+            and 6 <= len(compact) <= 40
+            and any(char.isdigit() for char in compact)
+        )
     return False
 
 
@@ -570,7 +837,26 @@ def _id_token_ok(value: str) -> bool:
 
 
 def _digits(text: str) -> str:
-    return re.sub(r"\D", "", text)
+    return re.sub(r"\D", "", text.translate(_DEV_DIGIT))
+
+
+def _mrn_prefix_ok(text: str) -> bool:
+    """Reject a dose or a lab token that happens to look like an id."""
+    prefix = re.match(r"[A-Za-z]+", text)
+    if prefix is None:
+        return False
+    return prefix.group(0).lower() not in _MRN_BLOCK
+
+
+def _is_name_leaf(leaf: str) -> bool:
+    """True when this column is a person's name, including a Hindi 'Naam'."""
+    if not leaf or leaf in _DOCTOR_KEYS or leaf in _MEDICINE_KEYS:
+        return False
+    if leaf in {"username", "filename", "hospitalname", "facilityname", "displayname"}:
+        return False
+    if leaf in _NAME_KEYS:
+        return True
+    return "naam" in leaf
 
 
 def _digit_count(text: str) -> int:

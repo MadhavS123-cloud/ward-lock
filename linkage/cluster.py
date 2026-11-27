@@ -29,7 +29,7 @@ _HONORIFICS = {
 }
 
 # These are not the patient's own name.
-_RELATIVE_CUES = {"C/O", "S/O", "D/O", "W/O"}
+_RELATIVE_CUES = {"C/O", "S/O", "D/O", "W/O", "KIN"}
 _PATIENT_FIELDS = {"patientname", "fullname", "name"}
 _SKIP_FIELDS = {
     "guardianname", "fathername", "mothername", "spousename", "husbandname",

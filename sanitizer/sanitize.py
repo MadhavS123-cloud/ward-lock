@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 
+from detection.engine import mask_personal_text
 from utils.medical import is_medical_span, is_medical_token
 
 # Shown where a personal value was removed. Keys stay, so the file shape stays.
@@ -26,7 +27,11 @@ _WIPE = {
     "patientname", "guardianname", "fathername", "mothername", "spousename",
     "husbandname", "wifename", "relativename", "attendantname", "fullname", "name",
     "aadhaar", "aadhar", "aadhaarno", "aadharno", "aadhaarnumber",
-    "pan", "panno", "pannumber",
+    "pan", "panno", "pannumber", "payerpan", "pancard", "panid",
+    "pin", "pincode", "zip", "zipcode", "postalcode", "postcode",
+    "pmjayid", "policyno", "policynumber", "policyid",
+    "insuranceid", "insuranceno", "memberid", "tpaid",
+    "firstname", "lastname", "middlename", "surname", "givenname", "familyname",
     "abha", "abhano", "abhanumber", "abhaid",
     "uhid", "uhidno", "mrn", "mrnno",
     "mobile", "mobileno", "mobilenumber",
@@ -41,6 +46,48 @@ _CLINICAL = (
     "vital", "diagnosis", "diagnos", "bp", "pulse", "spo2", "temperature",
     "heartrate",
 )
+
+# A whole column of places. "Village/Mohalla" becomes villagemohalla.
+# "city" in a registration row is the village. Hospital wards are a
+# different column ("ward") and are not listed here.
+_PLACE_LEAVES = {
+    "village", "gaon", "gram", "city", "street", "pata", "mohalla",
+    "locality", "landmark", "house", "houseno", "housenumber", "hno",
+}
+
+# Free-text places. A hospital line such as "Ward: 4 (Medicine)" does not
+# start with Address, so it stays. "gram positive" stays because the word
+# after gram is not a capitalized place name.
+_ADDRESS_LINE = re.compile(r"(?im)^[ \t]*address\b[^\n]*|^[ \t]*पता\b[^\n]*")
+_HOUSE = re.compile(
+    r"(?i)(?<![A-Za-z])(?:h\.?[ \t]*no\.?|house|makan[ \t]+no\.?)[ \t]*\d{1,6}\b"
+    r"|मकान[ \t]+नं\.?[ \t]*[0-9\u0966-\u096F]{1,6}"
+)
+_VILLAGE_CUE = re.compile(
+    r"(?i:\b(?:vill\.?|village|gram)\b)[ \t]*[:.]?[ \t]*"
+    r"[A-Z][A-Za-z]+(?:[ \t]+(?:Kalan|Khurd|[A-Z][a-z]+))?"
+)
+_HI_VILLAGE = re.compile(
+    r"(?:ग्राम|गाँव|गांव)[ \t]*[:：]?[ \t]*"
+    r"(?:[\u0904-\u0939\u0958-\u095F][\u0900-\u097F]*)"
+    r"(?:[ \t]+[\u0904-\u0939\u0958-\u095F][\u0900-\u097F]*){0,2}"
+)
+
+# A given name with nothing around it except these cues. "ASHA workers"
+# is all capitals, and "Dr. Ramesh" is behind "Dr.", so neither matches.
+_ATTENDANT = re.compile(r"(?<![A-Za-z])([A-Z][a-z]{2,})(?=['’]s attendant\b)")
+_KA_BP = re.compile(
+    r"(?<!Dr\. )(?<!Dr )(?<![A-Za-z])([A-Z][a-z]{2,})(?=\s+ka\s+BP\b)"
+)
+_MOHD = re.compile(
+    r"(?<!Dr\. )(?<!Dr )(?<![A-Za-z])(?:Mohd|Md)\.\s+[A-Z][a-z]{2,}\b"
+)
+_GIVEN_SKIP = {
+    "patient", "sample", "review", "doctor", "address", "house", "ward",
+    "tablet", "blood", "sugar", "fever", "pain", "daily", "morning",
+    "evening", "night", "discharge", "medicine", "hospital", "village",
+    "attendant", "primary", "essential", "general", "continue", "advised",
+}
 
 
 def sanitize(records: list[dict], findings: list[dict], policy: dict) -> list[dict]:
@@ -97,22 +144,31 @@ def _walk(
     if leaf and _is_clinical(leaf):
         return value
     # An identifier column is removed as a whole, including nested address parts.
-    if leaf and leaf in wipe:
+    # A village, street, or gaon column is a place even when the value is one word.
+    if leaf and (leaf in wipe or _is_place_leaf(leaf)):
         if value is None or (isinstance(value, str) and not value.strip()):
             return value
         return _TOKEN
     if isinstance(value, dict):
-        return {
-            key: _walk(item, f"{path}.{key}" if path else str(key), by_field, wipe, depth + 1)
-            for key, item in value.items()
-        }
+        # A key can be the personal data (a patient name, a UHID, a CSV header).
+        # The child path stays the original key so a detected value still lines up.
+        rebuilt: dict = {}
+        used: set[str] = set()
+        for key, item in value.items():
+            child = f"{path}.{key}" if path else str(key)
+            cleaned = _walk(item, child, by_field, wipe, depth + 1)
+            renamed = _unique_key(mask_personal_text(str(key)), used)
+            rebuilt[renamed] = cleaned
+        return rebuilt
     if isinstance(value, list):
         return [
             _walk(item, f"{path}[{index}]", by_field, wipe, depth + 1)
             for index, item in enumerate(value)
         ]
-    if isinstance(value, str) and path in by_field:
-        return _cut(value, by_field[path])
+    if isinstance(value, str):
+        if path in by_field:
+            value = _cut(value, by_field[path])
+        return _scrub_free_text(value)
     return value
 
 
@@ -166,8 +222,60 @@ def _redact_span(span: str) -> str:
 _WORD = re.compile(r"[0-9A-Za-z\u0900-\u097F]+(?:['’][A-Za-z]+)?")
 
 
+def _unique_key(key: str, used: set[str]) -> str:
+    """Keep a renamed header from colliding with another column."""
+    if key not in used:
+        used.add(key)
+        return key
+    number = 2
+    while f"{key}_{number}" in used:
+        number += 1
+    fresh = f"{key}_{number}"
+    used.add(fresh)
+    return fresh
+
+
 def _is_clinical(leaf: str) -> bool:
     return any(part in leaf for part in _CLINICAL)
+
+
+def _is_place_leaf(leaf: str) -> bool:
+    """True for a column that holds a village, house line, or locality.
+
+    An ABHA address is an id, not a place column. A ward column is the
+    hospital ward and is left for the clinical text to keep.
+    """
+    if not leaf or "abha" in leaf:
+        return False
+    if leaf in _PLACE_LEAVES or "village" in leaf:
+        return True
+    return leaf.startswith("address") or leaf.endswith("address")
+
+
+def _scrub_free_text(text: str) -> str:
+    """Remove place lines and bare given names that a column wipe cannot see.
+
+    Clinical fields never reach this function. A line that only shares the
+    word "ward" with an address, such as "Ward: 4 (Medicine)", is not an
+    address line and is not changed.
+    """
+    if not text or text == _TOKEN:
+        return text
+    text = _ADDRESS_LINE.sub(_TOKEN, text)
+    text = _HOUSE.sub(_TOKEN, text)
+    text = _VILLAGE_CUE.sub(_TOKEN, text)
+    text = _HI_VILLAGE.sub(_TOKEN, text)
+    text = _ATTENDANT.sub(lambda match: _given(match.group(1)), text)
+    text = _KA_BP.sub(lambda match: _given(match.group(1)), text)
+    text = _MOHD.sub(_TOKEN, text)
+    return text
+
+
+def _given(token: str) -> str:
+    """Blank one given name. A medical word in the same slot stays."""
+    if is_medical_token(token) or token.lower() in _GIVEN_SKIP:
+        return token
+    return _TOKEN
 
 
 def _leaf(field: str) -> str:
